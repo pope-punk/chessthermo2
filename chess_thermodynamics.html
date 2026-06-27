@@ -1977,6 +1977,58 @@ var Chess = function(fen) {
       }
 
       return move_history
+    },
+
+    // ── Fast paths (no SAN, no object alloc) ──────────────
+    fast_moves: function() {
+      return generate_moves()
+    },
+    fast_make: function(m) {
+      make_move(m)
+    },
+    fast_undo: function() {
+      undo_move()
+    },
+    fast_raw_u: function(xt) {
+      var Uw = 0, Ub = 0
+      for (var i = SQUARES.a8; i <= SQUARES.h1; i++) {
+        if (i & 0x88) { i += 7; continue }
+        var p = board[i]
+        if (p == null) continue
+        var r = 7 - (i >> 4), f = i & 7
+        var idx = r * 8 + f
+        if (p.color === WHITE) Uw += xt['w' + p.type][idx]
+        else Ub += xt['b' + p.type][idx]
+      }
+      return (turn === WHITE) ? Uw - Ub : Ub - Uw
+    },
+    fast_raw_u_split: function(xt) {
+      var Uw = 0, Ub = 0
+      for (var i = SQUARES.a8; i <= SQUARES.h1; i++) {
+        if (i & 0x88) { i += 7; continue }
+        var p = board[i]
+        if (p == null) continue
+        var r = 7 - (i >> 4), f = i & 7
+        var idx = r * 8 + f
+        if (p.color === WHITE) Uw += xt['w' + p.type][idx]
+        else Ub += xt['b' + p.type][idx]
+      }
+      return { Uw: Uw, Ub: Ub }
+    },
+    fast_in_check: function() {
+      return in_check()
+    },
+    fast_in_checkmate: function() {
+      return in_checkmate()
+    },
+    fast_turn: function() {
+      return turn
+    },
+    fast_to_san: function(m) {
+      return move_to_san(m)
+    },
+    fast_algebraic: function(i) {
+      return algebraic(i)
     }
   }
 }
@@ -1997,7 +2049,10 @@ const T_FLOOR = 0.1;
 const PAWN_XRAY = 3.5;
 const CHECKMATE_SCORE = 100000;
 const NULL_MOVE_R = 2;
-const MAX_Q_DEPTH = 4;
+const MAX_Q_DEPTH = 3;
+const FUTILITY_MARGIN = 12;
+const LMR_FULL_MOVES = 4;
+const LMR_MIN_DEPTH = 3;
 const NODE_BUDGETS = { easy: 10000, medium: 50000, hard: 200000, max: 1000000 };
 const PIECE_CHAR = {
     wk:'♔',wq:'♕',wr:'♖',wb:'♗',wn:'♘',wp:'♙',
@@ -2005,6 +2060,28 @@ const PIECE_CHAR = {
 };
 const PIECE_NAME = { p:'Pawn', n:'Knight', b:'Bishop', r:'Rook', q:'Queen' };
 const MVV = { p:1, n:3, b:3, r:5, q:9, k:100 };
+
+// ── Precomputed X-ray Mobility Table ───────────────────────
+const XRAY = {};
+(function buildXrayTable() {
+    function xm(type, file, rank, color) {
+        switch (type) {
+            case 'r': return 14;
+            case 'b': return Math.min(file,rank)+Math.min(7-file,rank)+Math.min(file,7-rank)+Math.min(7-file,7-rank);
+            case 'q': return 14+Math.min(file,rank)+Math.min(7-file,rank)+Math.min(file,7-rank)+Math.min(7-file,7-rank);
+            case 'n': { let c=0; for (const [df,dr] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]]) if (file+df>=0&&file+df<=7&&rank+dr>=0&&rank+dr<=7) c++; return c; }
+            case 'k': { let c=0; for (let df=-1;df<=1;df++) for (let dr=-1;dr<=1;dr++) { if (!df&&!dr) continue; if (file+df>=0&&file+df<=7&&rank+dr>=0&&rank+dr<=7) c++; } return c; }
+            case 'p': { let c=0,dir=color==='w'?1:-1,nr=rank+dir; if (nr>=0&&nr<=7) { c++; if (file>0) c++; if (file<7) c++; } if (rank===(color==='w'?1:6)) { if (rank+2*dir>=0&&rank+2*dir<=7) c++; } return c; }
+        }
+        return 0;
+    }
+    for (const color of ['w','b'])
+        for (const type of ['p','n','b','r','q','k']) {
+            const t = new Int8Array(64);
+            for (let rank=0;rank<8;rank++) for (let file=0;file<8;file++) t[rank*8+file]=xm(type,file,rank,color);
+            XRAY[color+type] = t;
+        }
+})();
 
 // ── Game State ─────────────────────────────────────────────
 let game = new Chess();
@@ -2031,62 +2108,41 @@ function ttPut(fen, depth, flag, value, best) {
     ttMap.set(fen, { depth, flag, value, best });
 }
 
-// ── X-ray Mobility (ideal gas leaf energy) ─────────────────
-function xrayMob(type, file, rank, color) {
-    switch (type) {
-        case 'r': return 14;
-        case 'b':
-            return Math.min(file,rank) + Math.min(7-file,rank) +
-                   Math.min(file,7-rank) + Math.min(7-file,7-rank);
-        case 'q':
-            return 14 + Math.min(file,rank) + Math.min(7-file,rank) +
-                   Math.min(file,7-rank) + Math.min(7-file,7-rank);
-        case 'n': {
-            let c = 0;
-            for (const [df,dr] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]])
-                if (file+df>=0 && file+df<=7 && rank+dr>=0 && rank+dr<=7) c++;
-            return c;
-        }
-        case 'k': {
-            let c = 0;
-            for (let df=-1;df<=1;df++) for (let dr=-1;dr<=1;dr++) {
-                if (!df && !dr) continue;
-                if (file+df>=0 && file+df<=7 && rank+dr>=0 && rank+dr<=7) c++;
-            }
-            return c;
-        }
-        case 'p': {
-            let c = 0;
-            const dir = color === 'w' ? 1 : -1;
-            const start = color === 'w' ? 1 : 6;
-            const nr = rank + dir;
-            if (nr >= 0 && nr <= 7) {
-                c++;
-                if (file > 0) c++;
-                if (file < 7) c++;
-            }
-            if (rank === start) { const nr2 = rank + 2*dir; if (nr2 >= 0 && nr2 <= 7) c++; }
-            return c;
-        }
-    }
-    return 0;
+// ── Eval Cache (avoids redundant thermoSearch) ─────────────
+const evalCache = new Map();
+const EVAL_CACHE_MAX = 200000;
+let evalCacheHits = 0;
+
+// ── Killer Moves (quiet moves that caused cutoffs) ─────────
+const killers = new Array(64);
+for (let i = 0; i < 64; i++) killers[i] = [0, 0];
+const historyTable = {};
+
+// ── X-ray Mobility (ideal gas leaf energy, table lookup) ───
+function rawU(g) {
+    return g.fast_raw_u_split ? g.fast_raw_u_split(XRAY) : rawU_slow(g);
 }
 
-function rawU(g) {
+function rawU_slow(g) {
     let Uw = 0, Ub = 0;
     const b = g.board();
     for (let row = 0; row < 8; row++)
         for (let col = 0; col < 8; col++) {
             const p = b[row][col];
             if (!p) continue;
-            const m = xrayMob(p.type, col, 7-row, p.color);
-            if (p.color === 'w') Uw += m; else Ub += m;
+            const idx = (7 - row) * 8 + col;
+            if (p.color === 'w') Uw += XRAY['w' + p.type][idx];
+            else Ub += XRAY['b' + p.type][idx];
         }
     return { Uw, Ub };
 }
 
 function leafEval(g) {
-    const { Uw, Ub } = rawU(g);
+    return g.fast_raw_u ? g.fast_raw_u(XRAY) : leafEval_slow(g);
+}
+
+function leafEval_slow(g) {
+    const { Uw, Ub } = rawU_slow(g);
     return g.turn() === 'w' ? Uw - Ub : Ub - Uw;
 }
 
@@ -2095,14 +2151,14 @@ function thermoSearch(g, depth) {
     nodeCount++;
     if (depth <= 0) return leafEval(g);
 
-    const moves = g.moves();
-    if (moves.length === 0) return g.in_checkmate() ? -CHECKMATE_SCORE : 0;
+    const moves = g.fast_moves();
+    if (moves.length === 0) return g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
 
     const Qs = new Array(moves.length);
     for (let i = 0; i < moves.length; i++) {
-        g.move(moves[i]);
+        g.fast_make(moves[i]);
         Qs[i] = -thermoSearch(g, depth - 1);
-        g.undo();
+        g.fast_undo();
     }
 
     const n = Qs.length;
@@ -2123,19 +2179,26 @@ function thermoSearch(g, depth) {
 }
 
 function evalPos(g) {
-    return thermoSearch(g, 1);
+    const key = g.fen();
+    const cached = evalCache.get(key);
+    if (cached !== undefined) { evalCacheHits++; return cached; }
+    const val = thermoSearch(g, 1);
+    if (evalCache.size < EVAL_CACHE_MAX) evalCache.set(key, val);
+    return val;
 }
 
 // ── Full Thermodynamic State (dashboard) ───────────────────
 function computeThermodynamics(g, depth) {
-    const moves = g.moves();
-    if (moves.length === 0) return null;
+    const rawMoves = g.fast_moves();
+    if (rawMoves.length === 0) return null;
 
-    const Qs = new Array(moves.length);
-    for (let i = 0; i < moves.length; i++) {
-        g.move(moves[i]);
+    const Qs = new Array(rawMoves.length);
+    const moves = new Array(rawMoves.length);
+    for (let i = 0; i < rawMoves.length; i++) {
+        moves[i] = g.fast_to_san(rawMoves[i]);
+        g.fast_make(rawMoves[i]);
         Qs[i] = -thermoSearch(g, depth - 1);
-        g.undo();
+        g.fast_undo();
     }
 
     const n = Qs.length;
@@ -2207,18 +2270,46 @@ function computeChemicalPotentials(g, depth, thermo) {
     return mu;
 }
 
-// ── Move Ordering ──────────────────────────────────────────
-function orderMoves(moves, ttBest) {
+// ── Move key: pack from/to into a single int for TT/killers/history
+function moveKey(m) { return (m.from << 8) | m.to; }
+
+// ── Move Ordering (TT → captures/MVV-LVA → killers → history)
+function orderMoves(moves, ttBestKey, ply) {
+    const k = killers[ply] || [0, 0];
     return moves.slice().sort((a, b) => {
-        if (a.san === ttBest) return -1;
-        if (b.san === ttBest) return 1;
-        const sa = (a.captured ? MVV[a.captured]*10 - MVV[a.piece] : 0) + (a.flags.indexOf('p')>=0 ? 800 : 0);
-        const sb = (b.captured ? MVV[b.captured]*10 - MVV[b.piece] : 0) + (b.flags.indexOf('p')>=0 ? 800 : 0);
+        const ka = moveKey(a), kb = moveKey(b);
+        if (ka === ttBestKey) return -1;
+        if (kb === ttBestKey) return 1;
+        let sa = 0, sb = 0;
+        if (a.captured) sa += 10000 + MVV[a.captured]*10 - MVV[a.piece];
+        if (b.captured) sb += 10000 + MVV[b.captured]*10 - MVV[b.piece];
+        if (a.flags & 16) sa += 9000;
+        if (b.flags & 16) sb += 9000;
+        if (!a.captured) {
+            if (ka === k[0]) sa += 5000;
+            else if (ka === k[1]) sa += 4500;
+            else sa += (historyTable[ka] || 0);
+        }
+        if (!b.captured) {
+            if (kb === k[0]) sb += 5000;
+            else if (kb === k[1]) sb += 4500;
+            else sb += (historyTable[kb] || 0);
+        }
         return sb - sa;
     });
 }
 
-// ── Quiescence Search ──────────────────────────────────────
+function storeKiller(mk, ply) {
+    if (killers[ply][0] !== mk) { killers[ply][1] = killers[ply][0]; killers[ply][0] = mk; }
+}
+
+function storeHistory(move, depth) {
+    const mk = moveKey(move);
+    historyTable[mk] = (historyTable[mk] || 0) + depth * depth;
+}
+
+// ── Quiescence Search (with delta pruning) ─────────────────
+const DELTA_VALS = { p: 4, n: 12, b: 12, r: 18, q: 36 };
 function quiesce(g, alpha, beta, qd) {
     nodeCount++;
     if (nodeCount > nodeLimit || qd <= 0) return evalPos(g);
@@ -2227,25 +2318,22 @@ function quiesce(g, alpha, beta, qd) {
     if (standPat >= beta) return beta;
     if (standPat > alpha) alpha = standPat;
 
-    const moves = g.moves({ verbose: true });
-    const caps = [];
+    const moves = g.fast_moves();
+    const TACTICAL = 2 | 8 | 16; // CAPTURE | EP_CAPTURE | PROMOTION
     for (let i = 0; i < moves.length; i++) {
-        const fl = moves[i].flags;
-        if (fl.indexOf('c') >= 0 || fl.indexOf('e') >= 0 || fl.indexOf('p') >= 0)
-            caps.push(moves[i]);
-    }
-
-    for (let i = 0; i < caps.length; i++) {
-        g.move(caps[i].san);
+        const m = moves[i];
+        if (!(m.flags & TACTICAL)) continue;
+        if (m.captured && standPat + (DELTA_VALS[m.captured] || 0) + 4 < alpha) continue;
+        g.fast_make(m);
         const score = -quiesce(g, -beta, -alpha, qd - 1);
-        g.undo();
+        g.fast_undo();
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
     }
     return alpha;
 }
 
-// ── Alpha-Beta + Null Move + TT ────────────────────────────
+// ── Alpha-Beta + Null Move + LMR + Futility + TT ──────────
 function searchAB(g, depth, alpha, beta, ply, nullOk) {
     nodeCount++;
     if (nodeCount > nodeLimit) return evalPos(g);
@@ -2261,77 +2349,136 @@ function searchAB(g, depth, alpha, beta, ply, nullOk) {
 
     if (depth <= 0) return quiesce(g, alpha, beta, MAX_Q_DEPTH);
 
-    const rawMoves = g.moves({ verbose: true });
-    if (rawMoves.length === 0) return g.in_checkmate() ? -CHECKMATE_SCORE + ply : 0;
+    const inCheck = g.fast_in_check();
+    const rawMoves = g.fast_moves();
+    if (rawMoves.length === 0) return inCheck ? -CHECKMATE_SCORE + ply : 0;
 
     // Null move pruning
-    if (nullOk && depth >= NULL_MOVE_R + 1 && !g.in_check() && Number.isFinite(beta)) {
+    if (nullOk && depth >= NULL_MOVE_R + 1 && !inCheck && Number.isFinite(beta)) {
         const parts = fen.split(' ');
         parts[1] = parts[1] === 'w' ? 'b' : 'w';
         parts[3] = '-';
         try {
             const ng = new Chess(parts.join(' '));
-            if (ng.moves().length > 0) {
+            if (ng.fast_moves().length > 0) {
                 const ns = -searchAB(ng, depth - 1 - NULL_MOVE_R, -beta, -beta + 1, ply + 1, false);
                 if (ns >= beta) return beta;
             }
         } catch (_) {}
     }
 
-    const moves = orderMoves(rawMoves, entry ? entry.best : null);
-    let bestMove = moves[0].san;
+    // Futility pruning: at depth 1, if static eval + margin < alpha, skip quiet moves
+    let futile = false;
+    if (depth === 1 && !inCheck && Number.isFinite(alpha)) {
+        const sEval = evalPos(g);
+        if (sEval + FUTILITY_MARGIN < alpha) futile = true;
+    }
+
+    const moves = orderMoves(rawMoves, entry ? entry.best : 0, ply);
+    let bestMoveKey = moveKey(moves[0]);
     let bestScore = -Infinity;
     let flag = TT_UPPER;
+    let movesSearched = 0;
 
     for (let i = 0; i < moves.length; i++) {
-        g.move(moves[i].san);
-        const score = -searchAB(g, depth - 1, -beta, -alpha, ply + 1, true);
-        g.undo();
+        const m = moves[i];
+        const isCapture = !!m.captured;
+        const isPromo = !!(m.flags & 16);
+        const isTactical = isCapture || isPromo;
 
-        if (score > bestScore) { bestScore = score; bestMove = moves[i].san; }
+        if (futile && !isTactical && movesSearched > 0) continue;
+
+        g.fast_make(m);
+        const givesCheck = g.fast_in_check();
+        let score;
+
+        if (movesSearched >= LMR_FULL_MOVES && depth >= LMR_MIN_DEPTH &&
+            !isTactical && !inCheck && !givesCheck) {
+            score = -searchAB(g, depth - 2, -beta, -alpha, ply + 1, true);
+            if (score > alpha) score = -searchAB(g, depth - 1, -beta, -alpha, ply + 1, true);
+        } else {
+            score = -searchAB(g, depth - 1, -beta, -alpha, ply + 1, true);
+        }
+        g.fast_undo();
+        movesSearched++;
+
+        if (score > bestScore) { bestScore = score; bestMoveKey = moveKey(m); }
         if (score > alpha) { alpha = score; flag = TT_EXACT; }
-        if (alpha >= beta) { flag = TT_LOWER; break; }
+        if (alpha >= beta) {
+            flag = TT_LOWER;
+            if (!isTactical) { storeKiller(moveKey(m), ply); storeHistory(m, depth); }
+            break;
+        }
         if (nodeCount > nodeLimit) break;
     }
 
-    ttPut(fen, depth, flag, bestScore, bestMove);
+    ttPut(fen, depth, flag, bestScore, bestMoveKey);
     return bestScore;
 }
 
-// ── Iterative Deepening ────────────────────────────────────
+// ── Iterative Deepening (with aspiration windows) ──────────
 function bestMoveID(g, maxDepth, budget) {
     nodeCount = 0;
+    evalCacheHits = 0;
     nodeLimit = budget;
     ttMap.clear();
+    for (let i = 0; i < 64; i++) killers[i] = [0, 0];
+    for (const k in historyTable) delete historyTable[k];
 
-    const moves = g.moves();
+    const moves = g.fast_moves();
     if (moves.length === 0) return null;
-    if (moves.length === 1) return moves[0];
+    if (moves.length === 1) return g.fast_to_san(moves[0]);
 
     let bestMove = moves[0];
+    let bestScore = 0;
     let reachedDepth = 0;
 
     for (let depth = 1; depth <= maxDepth; depth++) {
-        let alpha = -Infinity;
+        let alpha, beta;
+        if (depth >= 3 && Number.isFinite(bestScore)) {
+            const window = 8 + depth;
+            alpha = bestScore - window;
+            beta = bestScore + window;
+        } else {
+            alpha = -Infinity;
+            beta = Infinity;
+        }
+
         let best = null;
+        let score0 = -Infinity;
         const ordered = [bestMove, ...moves.filter(m => m !== bestMove)];
 
         for (let i = 0; i < ordered.length; i++) {
-            g.move(ordered[i]);
-            const score = -searchAB(g, depth - 1, -Infinity, -alpha, 1, true);
-            g.undo();
+            g.fast_make(ordered[i]);
+            const score = -searchAB(g, depth - 1, -beta, -alpha, 1, true);
+            g.fast_undo();
 
-            if (score > alpha || !best) { alpha = score; best = ordered[i]; }
+            if (score > score0 || !best) { score0 = score; best = ordered[i]; }
+            if (score > alpha) alpha = score;
             if (nodeCount >= nodeLimit) break;
         }
 
+        if (Number.isFinite(beta) && score0 >= beta && nodeCount < nodeLimit) {
+            alpha = -Infinity;
+            best = null;
+            score0 = -Infinity;
+            for (let i = 0; i < ordered.length; i++) {
+                g.fast_make(ordered[i]);
+                const score = -searchAB(g, depth - 1, -Infinity, -alpha, 1, true);
+                g.fast_undo();
+                if (score > score0 || !best) { score0 = score; best = ordered[i]; }
+                if (score > alpha) alpha = score;
+                if (nodeCount >= nodeLimit) break;
+            }
+        }
+
         reachedDepth = depth;
-        if (best) bestMove = best;
+        if (best) { bestMove = best; bestScore = score0; }
         if (nodeCount >= nodeLimit) break;
     }
 
-    searchStats = { depth: reachedDepth, nodes: nodeCount };
-    return bestMove;
+    searchStats = { depth: reachedDepth, nodes: nodeCount, cacheHits: evalCacheHits };
+    return g.fast_to_san(bestMove);
 }
 
 // ── Board Rendering ────────────────────────────────────────
@@ -2466,8 +2613,10 @@ function doAiMove() {
         handleGameOver();
     } else {
         const side = humanColor === 'w' ? 'White' : 'Black';
-        setStatus('Your move (' + side + ') — AI depth ' +
-            searchStats.depth + ', ' + searchStats.nodes.toLocaleString() + ' nodes');
+        const pct = searchStats.nodes > 0 ? Math.round(100 * searchStats.cacheHits / searchStats.nodes) : 0;
+        setStatus('Your move (' + side + ') — depth ' +
+            searchStats.depth + ', ' + searchStats.nodes.toLocaleString() + ' nodes, ' +
+            pct + '% cache hits');
     }
 }
 
@@ -2515,6 +2664,7 @@ function newGame() {
     lastMoveSquares = null;
     moveHistory = [];
     ttMap.clear();
+    evalCache.clear();
     renderBoard();
     updateMoveList();
     updateDashboard();
