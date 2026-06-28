@@ -2031,6 +2031,16 @@ var Chess = function(fen) {
     },
     fast_algebraic: function(i) {
       return algebraic(i)
+    },
+    fast_pos_key: function() {
+      var k = turn;
+      for (var i = SQUARES.a8; i <= SQUARES.h1; i++) {
+        if (i & 0x88) { i += 7; continue; }
+        var p = board[i];
+        k += p ? p.color + p.type : '.';
+      }
+      k += castling.w + ',' + castling.b;
+      return k;
     }
   }
 }
@@ -2110,10 +2120,13 @@ function ttPut(fen, depth, flag, value, best) {
     ttMap.set(fen, { depth, flag, value, best });
 }
 
-// ── Eval Cache (avoids redundant thermoSearch) ─────────────
-const evalCache = new Map();
-const EVAL_CACHE_MAX = 200000;
-let evalCacheHits = 0;
+// ── Thermo Cache (depth-1 thermoSearch results, keyed by fast_pos_key) ──
+const thermoCache1 = new Map();
+const THERMO_CACHE1_MAX = 500000;
+
+// ── Chemical Potential Cache (for dashboard display) ──────
+const chemPotCache = new Map();
+const CHEMPOT_CACHE_MAX = 50000;
 
 // ── Killer Moves (quiet moves that caused cutoffs) ─────────
 const killers = new Array(64);
@@ -2148,31 +2161,94 @@ function leafEval_slow(g) {
     return g.turn() === 'w' ? Uw - Ub : Ub - Uw;
 }
 
+// ── 0x88 square → 8×8 XRAY index ─────────────────────────
+function sqIdx(sq88) { return (7 - (sq88 >> 4)) * 8 + (sq88 & 7); }
+
 // ── Thermodynamic Search: F = T ln Z ───────────────────────
-// Symmetric: at depth 1, opponent's option value is estimated
-// from their x-ray mobility (zero extra cost — same board scan).
+// Both sides computed identically — equilibrium requires symmetry.
+// Depth-1 uses incremental eval: compute base U once, then delta per move
+// (avoids fast_make/fast_undo and full board scans).
 function thermoSearch(g, depth) {
     nodeCount++;
     if (depth <= 0) return leafEval(g);
+
+    if (depth === 1) {
+        const key = g.fast_pos_key();
+        const cached = thermoCache1.get(key);
+        if (cached !== undefined) return cached;
+
+        const moves = g.fast_moves();
+        const n = moves.length;
+        if (n === 0) {
+            const v = g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
+            if (thermoCache1.size < THERMO_CACHE1_MAX) thermoCache1.set(key, v);
+            return v;
+        }
+
+        const { Uw, Ub } = rawU(g);
+        const us = moves[0].color;
+        const them = us === 'w' ? 'b' : 'w';
+        const baseQ = us === 'w' ? Uw - Ub : Ub - Uw;
+
+        const Qs = new Array(n);
+        for (let i = 0; i < n; i++) {
+            const m = moves[i];
+            const fi = sqIdx(m.from), ti = sqIdx(m.to);
+            let d = 0;
+
+            if (m.flags & 96) {
+                d += XRAY[us + 'k'][ti] - XRAY[us + 'k'][fi];
+                if (m.flags & 32) {
+                    const rr = fi & ~7;
+                    d += XRAY[us + 'r'][rr | 5] - XRAY[us + 'r'][rr | 7];
+                } else {
+                    const rr = fi & ~7;
+                    d += XRAY[us + 'r'][rr | 3] - XRAY[us + 'r'][rr | 0];
+                }
+            } else if (m.promotion) {
+                d += XRAY[us + m.promotion][ti] - XRAY[us + 'p'][fi];
+            } else {
+                d += XRAY[us + m.piece][ti] - XRAY[us + m.piece][fi];
+            }
+
+            if (m.captured) {
+                if (m.flags & 8) {
+                    const epIdx = sqIdx((m.from & 0x70) | (m.to & 7));
+                    d += XRAY[them + 'p'][epIdx];
+                } else {
+                    d += XRAY[them + m.captured][ti];
+                }
+            }
+
+            Qs[i] = baseQ + d;
+        }
+
+        let sum = 0;
+        for (let i = 0; i < n; i++) sum += Qs[i];
+        const mean = sum / n;
+        let vsum = 0;
+        for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
+        const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+
+        let maxQ = Qs[0];
+        for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
+        if (!Number.isFinite(maxQ)) { if (thermoCache1.size < THERMO_CACHE1_MAX) thermoCache1.set(key, maxQ); return maxQ; }
+
+        let expSum = 0;
+        for (let i = 0; i < n; i++) expSum += Math.exp((Qs[i] - maxQ) / T);
+        const val = maxQ + T * Math.log(expSum);
+        if (thermoCache1.size < THERMO_CACHE1_MAX) thermoCache1.set(key, val);
+        return val;
+    }
 
     const moves = g.fast_moves();
     const n = moves.length;
     if (n === 0) return g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
 
     const Qs = new Array(n);
-    let oppXray;
-    if (depth === 1) oppXray = new Array(n);
-
     for (let i = 0; i < n; i++) {
         g.fast_make(moves[i]);
-        if (depth === 1 && g.fast_raw_u_split) {
-            const s = g.fast_raw_u_split(XRAY);
-            const t = g.turn();
-            Qs[i] = t === 'w' ? s.Ub - s.Uw : s.Uw - s.Ub;
-            oppXray[i] = t === 'w' ? s.Uw : s.Ub;
-        } else {
-            Qs[i] = -thermoSearch(g, depth - 1);
-        }
+        Qs[i] = -thermoSearch(g, depth - 1);
         g.fast_undo();
     }
 
@@ -2183,13 +2259,6 @@ function thermoSearch(g, depth) {
     for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
     const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
 
-    if (depth === 1) {
-        for (let i = 0; i < n; i++) {
-            const effMoves = oppXray[i] / PAWN_XRAY;
-            if (effMoves > 1) Qs[i] -= T * Math.log(effMoves);
-        }
-    }
-
     let maxQ = Qs[0];
     for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
     if (!Number.isFinite(maxQ)) return maxQ;
@@ -2199,14 +2268,13 @@ function thermoSearch(g, depth) {
     return maxQ + T * Math.log(expSum);
 }
 
+// ── Search Eval: depth-1 thermoSearch (incremental, cached) ──
+// Both sides use the same symmetric thermoSearch → equilibrium maintained.
+// Alpha-beta search provides the multi-ply lookahead.
 function evalPos(g) {
-    const key = g.fen();
-    const cached = evalCache.get(key);
-    if (cached !== undefined) { evalCacheHits++; return cached; }
     const savedNC = nodeCount;
     const val = thermoSearch(g, 1);
     nodeCount = savedNC;
-    if (evalCache.size < EVAL_CACHE_MAX) evalCache.set(key, val);
     return val;
 }
 
@@ -2331,8 +2399,46 @@ function storeHistory(move, depth) {
     historyTable[mk] = (historyTable[mk] || 0) + depth * depth;
 }
 
-// ── Quiescence Search (with delta pruning) ─────────────────
-const DELTA_VALS = { p: 4, n: 12, b: 12, r: 18, q: 36 };
+// ── Chemical Potential for Dashboard ──────────────────────
+// mu(piece) = change in free energy when that piece is removed.
+function getChemPot(g) {
+    const fen = g.fen();
+    const cached = chemPotCache.get(fen);
+    if (cached) return cached;
+
+    const F0 = thermoSearch(g, 1);
+    const board = g.board();
+    const oppColor = g.turn() === 'w' ? 'b' : 'w';
+
+    const locs = {};
+    for (let row = 0; row < 8; row++)
+        for (let col = 0; col < 8; col++) {
+            const p = board[row][col];
+            if (p && p.color === oppColor && p.type !== 'k')
+                if (!locs[p.type]) locs[p.type] = String.fromCharCode(97+col) + (8-row);
+        }
+
+    const mu = {};
+    for (const type of Object.keys(locs)) {
+        try {
+            const mod = new Chess(fen);
+            mod.remove(locs[type]);
+            if (mod.fast_moves().length === 0) { mu[type] = 0; continue; }
+            const savedNC = nodeCount;
+            const Fmod = thermoSearch(mod, 1);
+            nodeCount = savedNC;
+            mu[type] = Fmod - F0;
+        } catch(_) { mu[type] = 0; }
+    }
+
+    if (chemPotCache.size < CHEMPOT_CACHE_MAX) chemPotCache.set(fen, mu);
+    return mu;
+}
+
+// ── Quiescence Search (XRAY-based delta pruning) ──────────
+// Uses depth-1 thermoSearch for stand-pat (fast, cached via thermoCache1).
+// Delta pruning uses captured piece's XRAY value directly — at depth 1,
+// chemical potential equals x-ray mobility, so this is exact.
 function quiesce(g, alpha, beta, qd) {
     nodeCount++;
     if (nodeCount > nodeLimit || qd <= 0) return evalPos(g);
@@ -2342,11 +2448,16 @@ function quiesce(g, alpha, beta, qd) {
     if (standPat > alpha) alpha = standPat;
 
     const moves = g.fast_moves();
-    const TACTICAL = 2 | 8 | 16; // CAPTURE | EP_CAPTURE | PROMOTION
+    const TACTICAL = 2 | 8 | 16;
     for (let i = 0; i < moves.length; i++) {
         const m = moves[i];
         if (!(m.flags & TACTICAL)) continue;
-        if (m.captured && standPat + (DELTA_VALS[m.captured] || 0) + 4 < alpha) continue;
+        if (m.captured) {
+            const oppColor = m.color === 'w' ? 'b' : 'w';
+            const capIdx = sqIdx(m.to);
+            const delta = XRAY[oppColor + m.captured][capIdx];
+            if (standPat + delta + 4 < alpha) continue;
+        }
         g.fast_make(m);
         const score = -quiesce(g, -beta, -alpha, qd - 1);
         g.fast_undo();
@@ -2442,7 +2553,6 @@ function searchAB(g, depth, alpha, beta, ply, nullOk) {
 // ── Iterative Deepening (with aspiration windows) ──────────
 function bestMoveID(g, maxDepth, budget) {
     nodeCount = 0;
-    evalCacheHits = 0;
     nodeLimit = budget;
     ttMap.clear();
     for (let i = 0; i < 64; i++) killers[i] = [0, 0];
@@ -2500,7 +2610,7 @@ function bestMoveID(g, maxDepth, budget) {
         if (nodeCount >= nodeLimit) break;
     }
 
-    searchStats = { depth: reachedDepth, nodes: nodeCount, cacheHits: evalCacheHits };
+    searchStats = { depth: reachedDepth, nodes: nodeCount, cacheHits: thermoCache1.size };
     return g.fast_to_san(bestMove);
 }
 
@@ -2687,7 +2797,8 @@ function newGame() {
     lastMoveSquares = null;
     moveHistory = [];
     ttMap.clear();
-    evalCache.clear();
+    thermoCache1.clear();
+    chemPotCache.clear();
     renderBoard();
     updateMoveList();
     updateDashboard();
