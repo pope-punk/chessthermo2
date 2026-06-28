@@ -2149,27 +2149,39 @@ function leafEval_slow(g) {
 }
 
 // ── Thermodynamic Search: F = T ln Z ───────────────────────
+// Symmetric eval: our F includes T·S bonus; opponent's option
+// value is penalized by counting their responses in each child.
 function thermoSearch(g, depth) {
     nodeCount++;
     if (depth <= 0) return leafEval(g);
 
     const moves = g.fast_moves();
-    if (moves.length === 0) return g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
+    const n = moves.length;
+    if (n === 0) return g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
 
-    const Qs = new Array(moves.length);
-    for (let i = 0; i < moves.length; i++) {
+    const Qs = new Array(n);
+    let oppMC;
+    if (depth === 1) oppMC = new Array(n);
+
+    for (let i = 0; i < n; i++) {
         g.fast_make(moves[i]);
         Qs[i] = -thermoSearch(g, depth - 1);
+        if (depth === 1) oppMC[i] = g.fast_moves().length;
         g.fast_undo();
     }
 
-    const n = Qs.length;
     let sum = 0;
     for (let i = 0; i < n; i++) sum += Qs[i];
     const mean = sum / n;
     let vsum = 0;
     for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
     const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+
+    if (depth === 1) {
+        for (let i = 0; i < n; i++) {
+            if (oppMC[i] > 0) Qs[i] -= T * Math.log(oppMC[i]);
+        }
+    }
 
     let maxQ = Qs[0];
     for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
@@ -2185,7 +2197,7 @@ function evalPos(g) {
     const cached = evalCache.get(key);
     if (cached !== undefined) { evalCacheHits++; return cached; }
     const savedNC = nodeCount;
-    const val = thermoSearch(g, 2);
+    const val = thermoSearch(g, 1);
     nodeCount = savedNC;
     if (evalCache.size < EVAL_CACHE_MAX) evalCache.set(key, val);
     return val;
