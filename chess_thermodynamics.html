@@ -2110,6 +2110,11 @@ const thermoCache = new Map();
 const THERMO_CACHE_MAX = 500000;
 let lastRootThermo = null;
 
+// ── Chemical Potential Cache (keyed by board state, persists across searches)
+// μ[sq] = XRAY[piece,sq] - T·ln(1 - P_sq) where P_sq = Boltzmann prob of moves from sq
+const muCache = new Map();
+const MU_CACHE_MAX = 200000;
+
 // ── X-ray Mobility (ideal gas leaf energy, table lookup) ───
 function rawU(g) {
     return g.fast_raw_u_split ? g.fast_raw_u_split(XRAY) : rawU_slow(g);
@@ -2130,6 +2135,24 @@ function rawU_slow(g) {
 }
 
 function leafEval(g) {
+    const bk = g.fast_pos_key().substring(1);
+    const muEntry = muCache.get(bk);
+    if (muEntry) {
+        const b = g.board();
+        const turn = g.turn();
+        let Uus = 0, Uthem = 0;
+        for (let row = 0; row < 8; row++)
+            for (let col = 0; col < 8; col++) {
+                const p = b[row][col];
+                if (!p) continue;
+                const sq = (7 - row) * 8 + col;
+                const mv = muEntry[sq];
+                const val = mv !== undefined ? mv : XRAY[p.color + p.type][sq];
+                if (p.color === turn) Uus += val;
+                else Uthem += val;
+            }
+        return Uus - Uthem;
+    }
     return g.fast_raw_u ? g.fast_raw_u(XRAY) : leafEval_slow(g);
 }
 
@@ -2151,7 +2174,8 @@ function thermoSearch(g, depth) {
     nodeCount++;
     if (depth <= 0) return leafEval(g);
 
-    const key = depth + ':' + g.fast_pos_key();
+    const posKey = g.fast_pos_key();
+    const key = depth + ':' + posKey;
     const cached = thermoCache.get(key);
     if (cached !== undefined) return cached;
 
@@ -2164,10 +2188,30 @@ function thermoSearch(g, depth) {
             return v;
         }
 
-        const { Uw, Ub } = rawU(g);
         const us = moves[0].color;
         const them = us === 'w' ? 'b' : 'w';
-        const baseQ = us === 'w' ? Uw - Ub : Ub - Uw;
+        const bk = posKey.substring(1);
+        const muEntry = muCache.get(bk);
+
+        let baseQ;
+        if (muEntry) {
+            let Uus = 0, Uthem = 0;
+            const b = g.board();
+            for (let row = 0; row < 8; row++)
+                for (let col = 0; col < 8; col++) {
+                    const p = b[row][col];
+                    if (!p) continue;
+                    const sq = (7 - row) * 8 + col;
+                    const mv = muEntry[sq];
+                    const val = mv !== undefined ? mv : XRAY[p.color + p.type][sq];
+                    if (p.color === us) Uus += val;
+                    else Uthem += val;
+                }
+            baseQ = Uus - Uthem;
+        } else {
+            const { Uw, Ub } = rawU(g);
+            baseQ = us === 'w' ? Uw - Ub : Ub - Uw;
+        }
 
         const Qs = new Array(n);
         for (let i = 0; i < n; i++) {
@@ -2192,17 +2236,56 @@ function thermoSearch(g, depth) {
 
             if (m.captured) {
                 if (m.flags & 8) {
-                    const epIdx = sqIdx((m.from & 0x70) | (m.to & 7));
-                    d += XRAY[them + 'p'][epIdx];
+                    const epSq = sqIdx((m.from & 0x70) | (m.to & 7));
+                    d += (muEntry && muEntry[epSq] !== undefined) ? muEntry[epSq] : XRAY[them + 'p'][epSq];
                 } else {
-                    d += XRAY[them + m.captured][ti];
+                    d += (muEntry && muEntry[ti] !== undefined) ? muEntry[ti] : XRAY[them + m.captured][ti];
                 }
             }
 
             Qs[i] = baseQ + d;
         }
 
-        return computeF(Qs, n, key);
+        let sum = 0;
+        for (let i = 0; i < n; i++) sum += Qs[i];
+        const mean = sum / n;
+        let vsum = 0;
+        for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
+        const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+
+        let maxQ = Qs[0];
+        for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
+        if (!Number.isFinite(maxQ)) {
+            if (thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(key, maxQ);
+            return maxQ;
+        }
+
+        const expArr = new Array(n);
+        let expSum = 0;
+        for (let i = 0; i < n; i++) {
+            expArr[i] = Math.exp((Qs[i] - maxQ) / T);
+            expSum += expArr[i];
+        }
+        const F = maxQ + T * Math.log(expSum);
+
+        const sqProb = new Float64Array(64);
+        for (let i = 0; i < n; i++)
+            sqProb[sqIdx(moves[i].from)] += expArr[i] / expSum;
+
+        const newMu = muEntry ? Object.assign({}, muEntry) : {};
+        const seen = new Uint8Array(64);
+        for (let i = 0; i < n; i++) {
+            const fromSq = sqIdx(moves[i].from);
+            if (seen[fromSq]) continue;
+            seen[fromSq] = 1;
+            const P = sqProb[fromSq];
+            newMu[fromSq] = XRAY[us + moves[i].piece][fromSq]
+                - T * Math.log(1 - Math.min(P, 1 - 1e-10));
+        }
+
+        if (muCache.size < MU_CACHE_MAX) muCache.set(bk, newMu);
+        if (thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(key, F);
+        return F;
     }
 
     const moves = g.fast_moves();
@@ -2370,37 +2453,28 @@ function computeThermodynamics(g, depth) {
     return { T, beta, Z, lnZ, F, S, C, avgQ, TS, probs, moves, Qs };
 }
 
-// ── Chemical Potential: mu_i = dF/dN_i at constant T ───────
-function computeChemicalPotentials(g, depth, thermo) {
-    if (!thermo) return {};
-    const F0 = thermo.F, S0 = thermo.S, T0 = thermo.T;
-    const color = g.turn();
+// ── Chemical Potential: analytical μ from lagged cache ─────
+function computeChemicalPotentials(g) {
+    const bk = g.fast_pos_key ? g.fast_pos_key().substring(1) : null;
+    const muEntry = bk ? muCache.get(bk) : null;
     const board = g.board();
-    const fen = g.fen();
+    const color = g.turn();
 
-    const locs = {};
+    const sums = {}, counts = {};
     for (let row = 0; row < 8; row++)
         for (let col = 0; col < 8; col++) {
             const p = board[row][col];
-            if (p && p.color === color && p.type !== 'k') {
-                const sq = String.fromCharCode(97+col) + (8-row);
-                (locs[p.type] || (locs[p.type] = [])).push(sq);
-            }
+            if (!p || p.color !== color || p.type === 'k') continue;
+            const sq = (7 - row) * 8 + col;
+            const val = muEntry && muEntry[sq] !== undefined
+                ? muEntry[sq]
+                : XRAY[p.color + p.type][sq];
+            sums[p.type] = (sums[p.type] || 0) + val;
+            counts[p.type] = (counts[p.type] || 0) + 1;
         }
 
     const mu = {};
-    for (const type of Object.keys(locs)) {
-        const sq = locs[type][0];
-        const mod = new Chess(fen);
-        mod.remove(sq);
-        const modMoves = mod.moves();
-        if (modMoves.length === 0) continue;
-
-        const saveNC = nodeCount;
-        const thermoP = computeThermodynamics(mod, depth);
-        nodeCount = saveNC;
-        if (thermoP) mu[type] = (F0 - thermoP.F) + S0 * (thermoP.T - T0);
-    }
+    for (const t of Object.keys(sums)) mu[t] = sums[t] / counts[t];
     return mu;
 }
 
@@ -2685,6 +2759,7 @@ function newGame() {
     lastMoveSquares = null;
     moveHistory = [];
     thermoCache.clear();
+    muCache.clear();
     lastRootThermo = null;
     renderBoard();
     updateMoveList();
@@ -2767,12 +2842,8 @@ function updateDashboard() {
     }
 
     let mu = {};
-    if (thermo && !game.game_over()) {
-        const saveNC = nodeCount;
-        nodeCount = 0;
-        const currentThermo = lastRootThermo ? computeThermodynamics(game, 1) : thermo;
-        mu = currentThermo ? computeChemicalPotentials(game, 1, currentThermo) : {};
-        nodeCount = saveNC;
+    if (!game.game_over()) {
+        mu = computeChemicalPotentials(game);
     }
 
     renderThermoGrid(Uw, Ub, thermo);
