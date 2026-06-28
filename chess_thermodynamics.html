@@ -219,8 +219,8 @@ label { font-size: 0.85em; }
         </select>
         <label>Depth:
             <select id="dashDepth" onchange="updateDashboard()">
-                <option value="1" selected>1</option>
-                <option value="2">2</option>
+                <option value="1">1</option>
+                <option value="2" selected>2</option>
                 <option value="3">3</option>
             </select>
         </label>
@@ -2184,7 +2184,9 @@ function evalPos(g) {
     const key = g.fen();
     const cached = evalCache.get(key);
     if (cached !== undefined) { evalCacheHits++; return cached; }
-    const val = thermoSearch(g, 1);
+    const savedNC = nodeCount;
+    const val = thermoSearch(g, 2);
+    nodeCount = savedNC;
     if (evalCache.size < EVAL_CACHE_MAX) evalCache.set(key, val);
     return val;
 }
