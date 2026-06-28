@@ -2149,8 +2149,8 @@ function leafEval_slow(g) {
 }
 
 // ── Thermodynamic Search: F = T ln Z ───────────────────────
-// Symmetric eval: our F includes T·S bonus; opponent's option
-// value is penalized by counting their responses in each child.
+// Symmetric: at depth 1, opponent's option value is estimated
+// from their x-ray mobility (zero extra cost — same board scan).
 function thermoSearch(g, depth) {
     nodeCount++;
     if (depth <= 0) return leafEval(g);
@@ -2160,13 +2160,19 @@ function thermoSearch(g, depth) {
     if (n === 0) return g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
 
     const Qs = new Array(n);
-    let oppMC;
-    if (depth === 1) oppMC = new Array(n);
+    let oppXray;
+    if (depth === 1) oppXray = new Array(n);
 
     for (let i = 0; i < n; i++) {
         g.fast_make(moves[i]);
-        Qs[i] = -thermoSearch(g, depth - 1);
-        if (depth === 1) oppMC[i] = g.fast_moves().length;
+        if (depth === 1 && g.fast_raw_u_split) {
+            const s = g.fast_raw_u_split(XRAY);
+            const t = g.turn();
+            Qs[i] = t === 'w' ? s.Ub - s.Uw : s.Uw - s.Ub;
+            oppXray[i] = t === 'w' ? s.Uw : s.Ub;
+        } else {
+            Qs[i] = -thermoSearch(g, depth - 1);
+        }
         g.fast_undo();
     }
 
@@ -2179,7 +2185,8 @@ function thermoSearch(g, depth) {
 
     if (depth === 1) {
         for (let i = 0; i < n; i++) {
-            if (oppMC[i] > 0) Qs[i] -= T * Math.log(oppMC[i]);
+            const effMoves = oppXray[i] / PAWN_XRAY;
+            if (effMoves > 1) Qs[i] -= T * Math.log(effMoves);
         }
     }
 
