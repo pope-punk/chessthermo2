@@ -2164,9 +2164,12 @@ function leafEval_slow(g) {
 // ── 0x88 square → 8×8 XRAY index ─────────────────────────
 function sqIdx(sq88) { return (7 - (sq88 >> 4)) * 8 + (sq88 & 7); }
 
-// ── Robust Temperature via Median Absolute Deviation ──────
-// stddev is dominated by outliers (e.g. CHECKMATE_SCORE among normal Q values).
-// MAD is insensitive to single extreme values, keeping T meaningful.
+// ── Self-Consistent Thermodynamic Temperature ─────────────
+// Phase 1: MAD for outlier-robust initial estimate (handles CHECKMATE_SCORE).
+// Phase 2: Iterate T = Boltzmann-weighted σ until self-consistent.
+// Unweighted T treats all moves equally, inflating T via bad moves the
+// Boltzmann distribution would ignore. The weighted σ measures spread
+// among competitive moves only, giving T = (∂S/∂U)⁻¹ at equilibrium.
 function robustT(Qs, n) {
     const tmp = new Array(n);
     for (let i = 0; i < n; i++) tmp[i] = Qs[i];
@@ -2175,7 +2178,30 @@ function robustT(Qs, n) {
     for (let i = 0; i < n; i++) tmp[i] = Math.abs(Qs[i] - med);
     tmp.sort((a, b) => a - b);
     const mad = n & 1 ? tmp[n >> 1] : (tmp[(n >> 1) - 1] + tmp[n >> 1]) * 0.5;
-    return Math.max(1.4826 * mad, T_FLOOR);
+    let T = Math.max(1.4826 * mad, T_FLOOR);
+
+    let maxQ = Qs[0];
+    for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
+
+    for (let iter = 0; iter < 8; iter++) {
+        let expSum = 0;
+        for (let i = 0; i < n; i++) {
+            tmp[i] = Math.exp((Qs[i] - maxQ) / T);
+            expSum += tmp[i];
+        }
+        let avgQ = 0, avgQ2 = 0;
+        for (let i = 0; i < n; i++) {
+            const p = tmp[i] / expSum;
+            avgQ += p * Qs[i];
+            avgQ2 += p * Qs[i] * Qs[i];
+        }
+        const sigW = Math.sqrt(Math.max(avgQ2 - avgQ * avgQ, 0));
+        const Tnew = Math.max(sigW, T_FLOOR);
+        if (Math.abs(Tnew - T) < 0.01) break;
+        T = Math.max(Math.sqrt(T * Tnew), T_FLOOR);
+    }
+
+    return T;
 }
 
 // ── Unified Thermodynamic Search: F = T ln Z ──────────────
