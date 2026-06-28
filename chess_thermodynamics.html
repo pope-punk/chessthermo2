@@ -2060,18 +2060,15 @@ if (typeof define !== 'undefined')
 const T_FLOOR = 0.1;
 const PAWN_XRAY = 3.5;
 const CHECKMATE_SCORE = 100000;
-const NULL_MOVE_R = 2;
-const MAX_Q_DEPTH = 3;
-const FUTILITY_MARGIN = 12;
-const LMR_FULL_MOVES = 4;
-const LMR_MIN_DEPTH = 3;
-const NODE_BUDGETS = { easy: 10000, medium: 50000, hard: 200000, max: 1000000 };
+const TIME_LIMITS = { easy: 500, medium: 2000, hard: 8000, max: 20000 };
+const MC_SAMPLES = 3;
+const BOLTZ_SIGMA = 3;
+const NODE_HARD_LIMIT = 5000000;
 const PIECE_CHAR = {
     wk:'♔',wq:'♕',wr:'♖',wb:'♗',wn:'♘',wp:'♙',
     bk:'♚',bq:'♛',br:'♜',bb:'♝',bn:'♞',bp:'♟'
 };
 const PIECE_NAME = { p:'Pawn', n:'Knight', b:'Bishop', r:'Rook', q:'Queen' };
-const MVV = { p:1, n:3, b:3, r:5, q:9, k:100 };
 
 // ── Precomputed X-ray Mobility Table ───────────────────────
 const XRAY = {};
@@ -2106,32 +2103,12 @@ let thinking = false;
 let lastMoveSquares = null;
 let moveHistory = [];
 let nodeCount = 0;
-let nodeLimit = 50000;
 let searchStats = { depth: 0, nodes: 0 };
 
-// ── Transposition Table ────────────────────────────────────
-const TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
-const ttMap = new Map();
-function ttGet(fen) { return ttMap.get(fen) || null; }
-function ttPut(fen, depth, flag, value, best) {
-    if (!Number.isFinite(value)) return;
-    const e = ttMap.get(fen);
-    if (e && e.depth > depth) return;
-    ttMap.set(fen, { depth, flag, value, best });
-}
-
-// ── Thermo Cache (depth-1 thermoSearch results, keyed by fast_pos_key) ──
-const thermoCache1 = new Map();
-const THERMO_CACHE1_MAX = 500000;
-
-// ── Chemical Potential Cache (for dashboard display) ──────
-const chemPotCache = new Map();
-const CHEMPOT_CACHE_MAX = 50000;
-
-// ── Killer Moves (quiet moves that caused cutoffs) ─────────
-const killers = new Array(64);
-for (let i = 0; i < 64; i++) killers[i] = [0, 0];
-const historyTable = {};
+// ── Thermodynamic Cache (unified, keyed by depth:position) ─
+const thermoCache = new Map();
+const THERMO_CACHE_MAX = 500000;
+let lastRootThermo = null;
 
 // ── X-ray Mobility (ideal gas leaf energy, table lookup) ───
 function rawU(g) {
@@ -2164,24 +2141,26 @@ function leafEval_slow(g) {
 // ── 0x88 square → 8×8 XRAY index ─────────────────────────
 function sqIdx(sq88) { return (7 - (sq88 >> 4)) * 8 + (sq88 & 7); }
 
-// ── Thermodynamic Search: F = T ln Z ───────────────────────
+// ── Unified Thermodynamic Search: F = T ln Z ──────────────
 // Both sides computed identically — equilibrium requires symmetry.
-// Depth-1 uses incremental eval: compute base U once, then delta per move
-// (avoids fast_make/fast_undo and full board scans).
+// depth 0: leafEval (raw x-ray mobility)
+// depth 1: incremental eval (XRAY deltas, no make/undo)
+// depth 2: all moves at depth 1 (depth 1 is fast enough)
+// depth >= 3: Boltzmann pruning + Monte Carlo tail sampling
 function thermoSearch(g, depth) {
     nodeCount++;
     if (depth <= 0) return leafEval(g);
 
-    if (depth === 1) {
-        const key = g.fast_pos_key();
-        const cached = thermoCache1.get(key);
-        if (cached !== undefined) return cached;
+    const key = depth + ':' + g.fast_pos_key();
+    const cached = thermoCache.get(key);
+    if (cached !== undefined) return cached;
 
+    if (depth === 1) {
         const moves = g.fast_moves();
         const n = moves.length;
         if (n === 0) {
             const v = g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
-            if (thermoCache1.size < THERMO_CACHE1_MAX) thermoCache1.set(key, v);
+            if (thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(key, v);
             return v;
         }
 
@@ -2223,35 +2202,104 @@ function thermoSearch(g, depth) {
             Qs[i] = baseQ + d;
         }
 
-        let sum = 0;
-        for (let i = 0; i < n; i++) sum += Qs[i];
-        const mean = sum / n;
-        let vsum = 0;
-        for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
-        const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
-
-        let maxQ = Qs[0];
-        for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
-        if (!Number.isFinite(maxQ)) { if (thermoCache1.size < THERMO_CACHE1_MAX) thermoCache1.set(key, maxQ); return maxQ; }
-
-        let expSum = 0;
-        for (let i = 0; i < n; i++) expSum += Math.exp((Qs[i] - maxQ) / T);
-        const val = maxQ + T * Math.log(expSum);
-        if (thermoCache1.size < THERMO_CACHE1_MAX) thermoCache1.set(key, val);
-        return val;
+        return computeF(Qs, n, key);
     }
 
     const moves = g.fast_moves();
     const n = moves.length;
-    if (n === 0) return g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
-
-    const Qs = new Array(n);
-    for (let i = 0; i < n; i++) {
-        g.fast_make(moves[i]);
-        Qs[i] = -thermoSearch(g, depth - 1);
-        g.fast_undo();
+    if (n === 0) {
+        const v = g.fast_in_checkmate() ? -CHECKMATE_SCORE : 0;
+        if (thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(key, v);
+        return v;
     }
 
+    let Qs;
+
+    if (depth === 2) {
+        Qs = new Array(n);
+        for (let i = 0; i < n; i++) {
+            g.fast_make(moves[i]);
+            Qs[i] = -thermoSearch(g, 1);
+            g.fast_undo();
+        }
+    } else {
+        const quickQs = new Array(n);
+        for (let i = 0; i < n; i++) {
+            g.fast_make(moves[i]);
+            quickQs[i] = -thermoSearch(g, depth - 2);
+            g.fast_undo();
+        }
+
+        let qMax = quickQs[0];
+        for (let i = 1; i < n; i++) if (quickQs[i] > qMax) qMax = quickQs[i];
+
+        let qSum = 0;
+        for (let i = 0; i < n; i++) qSum += quickQs[i];
+        const qMean = qSum / n;
+        let qVar = 0;
+        for (let i = 0; i < n; i++) qVar += (quickQs[i] - qMean) ** 2;
+        const T_est = Math.max(Math.sqrt(qVar / n), T_FLOOR);
+        const threshold = qMax - BOLTZ_SIGMA * T_est;
+
+        const exactIdx = [];
+        const samplePool = [];
+        for (let i = 0; i < n; i++) {
+            if (quickQs[i] >= threshold) exactIdx.push(i);
+            else samplePool.push(i);
+        }
+
+        Qs = quickQs.slice();
+
+        for (let i = 0; i < exactIdx.length; i++) {
+            const idx = exactIdx[i];
+            g.fast_make(moves[idx]);
+            Qs[idx] = -thermoSearch(g, depth - 1);
+            g.fast_undo();
+        }
+
+        const toSample = Math.min(MC_SAMPLES, samplePool.length);
+        if (toSample > 0) {
+            let sMaxQ = quickQs[samplePool[0]];
+            for (let j = 1; j < samplePool.length; j++)
+                if (quickQs[samplePool[j]] > sMaxQ) sMaxQ = quickQs[samplePool[j]];
+
+            const weights = new Array(samplePool.length);
+            let wSum = 0;
+            for (let j = 0; j < samplePool.length; j++) {
+                weights[j] = Math.exp((quickQs[samplePool[j]] - sMaxQ) / T_est);
+                wSum += weights[j];
+            }
+
+            const picked = new Uint8Array(samplePool.length);
+            for (let k = 0; k < toSample && wSum > 1e-30; k++) {
+                let r = Math.random() * wSum;
+                let chosen = -1;
+                for (let j = 0; j < samplePool.length; j++) {
+                    if (picked[j]) continue;
+                    r -= weights[j];
+                    if (r <= 0) { chosen = j; break; }
+                }
+                if (chosen < 0) {
+                    for (let j = samplePool.length - 1; j >= 0; j--)
+                        if (!picked[j]) { chosen = j; break; }
+                }
+                if (chosen < 0) break;
+                picked[chosen] = 1;
+                wSum -= weights[chosen];
+
+                const idx = samplePool[chosen];
+                g.fast_make(moves[idx]);
+                const fullQ = -thermoSearch(g, depth - 1);
+                g.fast_undo();
+                Qs[idx] = fullQ;
+            }
+        }
+    }
+
+    return computeF(Qs, n, key);
+}
+
+function computeF(Qs, n, cacheKey) {
     let sum = 0;
     for (let i = 0; i < n; i++) sum += Qs[i];
     const mean = sum / n;
@@ -2261,20 +2309,15 @@ function thermoSearch(g, depth) {
 
     let maxQ = Qs[0];
     for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
-    if (!Number.isFinite(maxQ)) return maxQ;
+    if (!Number.isFinite(maxQ)) {
+        if (cacheKey && thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(cacheKey, maxQ);
+        return maxQ;
+    }
 
     let expSum = 0;
     for (let i = 0; i < n; i++) expSum += Math.exp((Qs[i] - maxQ) / T);
-    return maxQ + T * Math.log(expSum);
-}
-
-// ── Search Eval: depth-1 thermoSearch (incremental, cached) ──
-// Both sides use the same symmetric thermoSearch → equilibrium maintained.
-// Alpha-beta search provides the multi-ply lookahead.
-function evalPos(g) {
-    const savedNC = nodeCount;
-    const val = thermoSearch(g, 1);
-    nodeCount = savedNC;
+    const val = maxQ + T * Math.log(expSum);
+    if (cacheKey && thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(cacheKey, val);
     return val;
 }
 
@@ -2361,257 +2404,104 @@ function computeChemicalPotentials(g, depth, thermo) {
     return mu;
 }
 
-// ── Move key: pack from/to into a single int for TT/killers/history
-function moveKey(m) { return (m.from << 8) | m.to; }
 
-// ── Move Ordering (TT → captures/MVV-LVA → killers → history)
-function orderMoves(moves, ttBestKey, ply) {
-    const k = killers[ply] || [0, 0];
-    return moves.slice().sort((a, b) => {
-        const ka = moveKey(a), kb = moveKey(b);
-        if (ka === ttBestKey) return -1;
-        if (kb === ttBestKey) return 1;
-        let sa = 0, sb = 0;
-        if (a.captured) sa += 10000 + MVV[a.captured]*10 - MVV[a.piece];
-        if (b.captured) sb += 10000 + MVV[b.captured]*10 - MVV[b.piece];
-        if (a.flags & 16) sa += 9000;
-        if (b.flags & 16) sb += 9000;
-        if (!a.captured) {
-            if (ka === k[0]) sa += 5000;
-            else if (ka === k[1]) sa += 4500;
-            else sa += (historyTable[ka] || 0);
-        }
-        if (!b.captured) {
-            if (kb === k[0]) sb += 5000;
-            else if (kb === k[1]) sb += 4500;
-            else sb += (historyTable[kb] || 0);
-        }
-        return sb - sa;
-    });
-}
-
-function storeKiller(mk, ply) {
-    if (killers[ply][0] !== mk) { killers[ply][1] = killers[ply][0]; killers[ply][0] = mk; }
-}
-
-function storeHistory(move, depth) {
-    const mk = moveKey(move);
-    historyTable[mk] = (historyTable[mk] || 0) + depth * depth;
-}
-
-// ── Chemical Potential for Dashboard ──────────────────────
-// mu(piece) = change in free energy when that piece is removed.
-function getChemPot(g) {
-    const fen = g.fen();
-    const cached = chemPotCache.get(fen);
-    if (cached) return cached;
-
-    const F0 = thermoSearch(g, 1);
-    const board = g.board();
-    const oppColor = g.turn() === 'w' ? 'b' : 'w';
-
-    const locs = {};
-    for (let row = 0; row < 8; row++)
-        for (let col = 0; col < 8; col++) {
-            const p = board[row][col];
-            if (p && p.color === oppColor && p.type !== 'k')
-                if (!locs[p.type]) locs[p.type] = String.fromCharCode(97+col) + (8-row);
-        }
-
-    const mu = {};
-    for (const type of Object.keys(locs)) {
-        try {
-            const mod = new Chess(fen);
-            mod.remove(locs[type]);
-            if (mod.fast_moves().length === 0) { mu[type] = 0; continue; }
-            const savedNC = nodeCount;
-            const Fmod = thermoSearch(mod, 1);
-            nodeCount = savedNC;
-            mu[type] = Fmod - F0;
-        } catch(_) { mu[type] = 0; }
-    }
-
-    if (chemPotCache.size < CHEMPOT_CACHE_MAX) chemPotCache.set(fen, mu);
-    return mu;
-}
-
-// ── Quiescence Search (XRAY-based delta pruning) ──────────
-// Uses depth-1 thermoSearch for stand-pat (fast, cached via thermoCache1).
-// Delta pruning uses captured piece's XRAY value directly — at depth 1,
-// chemical potential equals x-ray mobility, so this is exact.
-function quiesce(g, alpha, beta, qd) {
-    nodeCount++;
-    if (nodeCount > nodeLimit || qd <= 0) return evalPos(g);
-
-    const standPat = evalPos(g);
-    if (standPat >= beta) return beta;
-    if (standPat > alpha) alpha = standPat;
-
-    const moves = g.fast_moves();
-    const TACTICAL = 2 | 8 | 16;
-    for (let i = 0; i < moves.length; i++) {
-        const m = moves[i];
-        if (!(m.flags & TACTICAL)) continue;
-        if (m.captured) {
-            const oppColor = m.color === 'w' ? 'b' : 'w';
-            const capIdx = sqIdx(m.to);
-            const delta = XRAY[oppColor + m.captured][capIdx];
-            if (standPat + delta + 4 < alpha) continue;
-        }
-        g.fast_make(m);
-        const score = -quiesce(g, -beta, -alpha, qd - 1);
-        g.fast_undo();
-        if (score >= beta) return beta;
-        if (score > alpha) alpha = score;
-    }
-    return alpha;
-}
-
-// ── Alpha-Beta + Null Move + LMR + Futility + TT ──────────
-function searchAB(g, depth, alpha, beta, ply, nullOk) {
-    nodeCount++;
-    if (nodeCount > nodeLimit) return evalPos(g);
-
-    const fen = g.fen();
-    const entry = ttGet(fen);
-    if (entry && entry.depth >= depth) {
-        if (entry.flag === TT_EXACT) return entry.value;
-        if (entry.flag === TT_LOWER && entry.value > alpha) alpha = entry.value;
-        if (entry.flag === TT_UPPER && entry.value < beta) beta = entry.value;
-        if (alpha >= beta) return entry.value;
-    }
-
-    if (depth <= 0) return quiesce(g, alpha, beta, MAX_Q_DEPTH);
-
-    const inCheck = g.fast_in_check();
-    const rawMoves = g.fast_moves();
-    if (rawMoves.length === 0) return inCheck ? -CHECKMATE_SCORE + ply : 0;
-
-    // Null move pruning
-    if (nullOk && depth >= NULL_MOVE_R + 1 && !inCheck && Number.isFinite(beta)) {
-        const parts = fen.split(' ');
-        parts[1] = parts[1] === 'w' ? 'b' : 'w';
-        parts[3] = '-';
-        try {
-            const ng = new Chess(parts.join(' '));
-            if (ng.fast_moves().length > 0) {
-                const ns = -searchAB(ng, depth - 1 - NULL_MOVE_R, -beta, -beta + 1, ply + 1, false);
-                if (ns >= beta) return beta;
-            }
-        } catch (_) {}
-    }
-
-    // Futility pruning: at depth 1, if static eval + margin < alpha, skip quiet moves
-    let futile = false;
-    if (depth === 1 && !inCheck && Number.isFinite(alpha)) {
-        const sEval = evalPos(g);
-        if (sEval + FUTILITY_MARGIN < alpha) futile = true;
-    }
-
-    const moves = orderMoves(rawMoves, entry ? entry.best : 0, ply);
-    let bestMoveKey = moveKey(moves[0]);
-    let bestScore = -Infinity;
-    let flag = TT_UPPER;
-    let movesSearched = 0;
-
-    for (let i = 0; i < moves.length; i++) {
-        const m = moves[i];
-        const isCapture = !!m.captured;
-        const isPromo = !!(m.flags & 16);
-        const isTactical = isCapture || isPromo;
-
-        if (futile && !isTactical && movesSearched > 0) continue;
-
-        g.fast_make(m);
-        const givesCheck = g.fast_in_check();
-        let score;
-
-        if (movesSearched >= LMR_FULL_MOVES && depth >= LMR_MIN_DEPTH &&
-            !isTactical && !inCheck && !givesCheck) {
-            score = -searchAB(g, depth - 2, -beta, -alpha, ply + 1, true);
-            if (score > alpha) score = -searchAB(g, depth - 1, -beta, -alpha, ply + 1, true);
-        } else {
-            score = -searchAB(g, depth - 1, -beta, -alpha, ply + 1, true);
-        }
-        g.fast_undo();
-        movesSearched++;
-
-        if (score > bestScore) { bestScore = score; bestMoveKey = moveKey(m); }
-        if (score > alpha) { alpha = score; flag = TT_EXACT; }
-        if (alpha >= beta) {
-            flag = TT_LOWER;
-            if (!isTactical) { storeKiller(moveKey(m), ply); storeHistory(m, depth); }
-            break;
-        }
-        if (nodeCount > nodeLimit) break;
-    }
-
-    ttPut(fen, depth, flag, bestScore, bestMoveKey);
-    return bestScore;
-}
-
-// ── Iterative Deepening (with aspiration windows) ──────────
-function bestMoveID(g, maxDepth, budget) {
+// ── Time-limited Iterative Deepening (thermodynamic) ──────
+function bestMove(g, timeLimitMs) {
+    const deadline = performance.now() + timeLimitMs;
     nodeCount = 0;
-    nodeLimit = budget;
-    ttMap.clear();
-    for (let i = 0; i < 64; i++) killers[i] = [0, 0];
-    for (const k in historyTable) delete historyTable[k];
+    thermoCache.clear();
 
     const moves = g.fast_moves();
-    if (moves.length === 0) return null;
-    if (moves.length === 1) return g.fast_to_san(moves[0]);
+    const n = moves.length;
+    if (n === 0) { lastRootThermo = null; return null; }
+    if (n === 1) {
+        g.fast_make(moves[0]);
+        const q = -thermoSearch(g, 1);
+        g.fast_undo();
+        const name = g.fast_to_san(moves[0]);
+        lastRootThermo = {
+            T: T_FLOOR, beta: 1 / T_FLOOR, Z: 1, lnZ: 0, F: q,
+            S: 0, C: 0, avgQ: q, TS: 0,
+            probs: [1], moves: [name], Qs: [q], bestIdx: 0, depth: 1
+        };
+        searchStats = { depth: 1, nodes: nodeCount };
+        return name;
+    }
 
-    let bestMove = moves[0];
-    let bestScore = 0;
+    let lastComplete = null;
     let reachedDepth = 0;
 
-    for (let depth = 1; depth <= maxDepth; depth++) {
-        let alpha, beta;
-        if (depth >= 3 && Number.isFinite(bestScore)) {
-            const window = 8 + depth;
-            alpha = bestScore - window;
-            beta = bestScore + window;
-        } else {
-            alpha = -Infinity;
-            beta = Infinity;
-        }
+    for (let depth = 1; depth <= 64; depth++) {
+        const Qs = new Array(n);
+        let timedOut = false;
 
-        let best = null;
-        let score0 = -Infinity;
-        const ordered = [bestMove, ...moves.filter(m => m !== bestMove)];
-
-        for (let i = 0; i < ordered.length; i++) {
-            g.fast_make(ordered[i]);
-            const score = -searchAB(g, depth - 1, -beta, -alpha, 1, true);
+        for (let i = 0; i < n; i++) {
+            g.fast_make(moves[i]);
+            Qs[i] = -thermoSearch(g, depth - 1);
             g.fast_undo();
 
-            if (score > score0 || !best) { score0 = score; best = ordered[i]; }
-            if (score > alpha) alpha = score;
-            if (nodeCount >= nodeLimit) break;
+            if (performance.now() > deadline) { timedOut = true; break; }
         }
 
-        if (Number.isFinite(beta) && score0 >= beta && nodeCount < nodeLimit) {
-            alpha = -Infinity;
-            best = null;
-            score0 = -Infinity;
-            for (let i = 0; i < ordered.length; i++) {
-                g.fast_make(ordered[i]);
-                const score = -searchAB(g, depth - 1, -Infinity, -alpha, 1, true);
-                g.fast_undo();
-                if (score > score0 || !best) { score0 = score; best = ordered[i]; }
-                if (score > alpha) alpha = score;
-                if (nodeCount >= nodeLimit) break;
-            }
-        }
+        if (timedOut && lastComplete) break;
 
+        lastComplete = buildRootThermo(g, moves, Qs, depth);
         reachedDepth = depth;
-        if (best) { bestMove = best; bestScore = score0; }
-        if (nodeCount >= nodeLimit) break;
+
+        if (performance.now() > deadline) break;
+        if (nodeCount > NODE_HARD_LIMIT) break;
     }
 
-    searchStats = { depth: reachedDepth, nodes: nodeCount, cacheHits: thermoCache1.size };
-    return g.fast_to_san(bestMove);
+    lastRootThermo = lastComplete;
+    searchStats = { depth: reachedDepth, nodes: nodeCount };
+
+    if (!lastComplete) return g.fast_to_san(moves[0]);
+    return lastComplete.moves[lastComplete.bestIdx];
+}
+
+function buildRootThermo(g, rawMoves, Qs, depth) {
+    const n = rawMoves.length;
+
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += Qs[i];
+    const mean = sum / n;
+    let vsum = 0;
+    for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
+    const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+    const beta = 1 / T;
+
+    let maxQ = Qs[0], bestIdx = 0;
+    for (let i = 1; i < n; i++) {
+        if (Qs[i] > maxQ) { maxQ = Qs[i]; bestIdx = i; }
+    }
+
+    const expTerms = new Array(n);
+    let expSum = 0;
+    for (let i = 0; i < n; i++) {
+        expTerms[i] = Math.exp((Qs[i] - maxQ) / T);
+        expSum += expTerms[i];
+    }
+
+    const lnZ = maxQ / T + Math.log(expSum);
+    const Z = Math.exp(lnZ);
+    const F = T * lnZ;
+
+    const probs = new Array(n);
+    for (let i = 0; i < n; i++) probs[i] = expTerms[i] / expSum;
+
+    let avgQ = 0, avgQ2 = 0, S = 0;
+    for (let i = 0; i < n; i++) {
+        avgQ += probs[i] * Qs[i];
+        avgQ2 += probs[i] * Qs[i] * Qs[i];
+        if (probs[i] > 1e-15) S -= probs[i] * Math.log(probs[i]);
+    }
+    const TS = T * S;
+    const C = (avgQ2 - avgQ * avgQ) / (T * T);
+
+    const moveNames = new Array(n);
+    for (let i = 0; i < n; i++) moveNames[i] = g.fast_to_san(rawMoves[i]);
+
+    return { T, beta, Z, lnZ, F, S, C, avgQ, TS, probs, moves: moveNames, Qs, bestIdx, depth };
 }
 
 // ── Board Rendering ────────────────────────────────────────
@@ -2726,8 +2616,8 @@ function makeHumanMove(from, to, promo) {
 
 function doAiMove() {
     if (!thinking || game.game_over()) { thinking = false; return; }
-    const budget = NODE_BUDGETS[document.getElementById('difficulty').value];
-    const move = bestMoveID(game, 30, budget);
+    const timeLimit = TIME_LIMITS[document.getElementById('difficulty').value];
+    const move = bestMove(game, timeLimit);
 
     if (move) {
         const result = game.move(move);
@@ -2746,10 +2636,8 @@ function doAiMove() {
         handleGameOver();
     } else {
         const side = humanColor === 'w' ? 'White' : 'Black';
-        const pct = searchStats.nodes > 0 ? Math.round(100 * searchStats.cacheHits / searchStats.nodes) : 0;
         setStatus('Your move (' + side + ') — depth ' +
-            searchStats.depth + ', ' + searchStats.nodes.toLocaleString() + ' nodes, ' +
-            pct + '% cache hits');
+            searchStats.depth + ', ' + searchStats.nodes.toLocaleString() + ' nodes');
     }
 }
 
@@ -2796,9 +2684,8 @@ function newGame() {
     legalTargets = [];
     lastMoveSquares = null;
     moveHistory = [];
-    ttMap.clear();
-    thermoCache1.clear();
-    chemPotCache.clear();
+    thermoCache.clear();
+    lastRootThermo = null;
     renderBoard();
     updateMoveList();
     updateDashboard();
@@ -2819,6 +2706,7 @@ function undoMove() {
     lastMoveSquares = null;
     selectedSq = null;
     legalTargets = [];
+    lastRootThermo = null;
     renderBoard();
     updateMoveList();
     updateDashboard();
@@ -2863,16 +2751,29 @@ function updateMoveList() {
 
 // ── Dashboard ──────────────────────────────────────────────
 function updateDashboard() {
-    const depth = parseInt(document.getElementById('dashDepth').value) || 1;
     const { Uw, Ub } = rawU(game);
 
-    const saveNC = nodeCount, saveNL = nodeLimit;
-    nodeCount = 0; nodeLimit = Infinity;
+    let thermo = null;
+    if (game.game_over()) {
+        thermo = null;
+    } else if (lastRootThermo) {
+        thermo = lastRootThermo;
+    } else {
+        const depth = parseInt(document.getElementById('dashDepth').value) || 1;
+        const saveNC = nodeCount;
+        nodeCount = 0;
+        thermo = computeThermodynamics(game, depth);
+        nodeCount = saveNC;
+    }
 
-    const thermo = computeThermodynamics(game, depth);
-    const mu = thermo ? computeChemicalPotentials(game, 1, thermo) : {};
-
-    nodeCount = saveNC; nodeLimit = saveNL;
+    let mu = {};
+    if (thermo && !game.game_over()) {
+        const saveNC = nodeCount;
+        nodeCount = 0;
+        const currentThermo = lastRootThermo ? computeThermodynamics(game, 1) : thermo;
+        mu = currentThermo ? computeChemicalPotentials(game, 1, currentThermo) : {};
+        nodeCount = saveNC;
+    }
 
     renderThermoGrid(Uw, Ub, thermo);
     renderChemPot(mu);
@@ -2894,9 +2795,13 @@ function renderThermoGrid(Uw, Ub, th) {
     const grid = document.getElementById('thermo-grid');
     if (!th) { grid.innerHTML = '<span class="dash-label">Game over</span>'; return; }
 
-    const evalW = game.turn() === 'w' ? th.F : -th.F;
+    const isAiAnalysis = th.depth !== undefined;
+    const evalSide = isAiAnalysis ? aiColor : game.turn();
+    const evalW = evalSide === 'w' ? th.F : -th.F;
     const sign = evalW >= 0 ? '+' : '';
-    const turn = game.turn() === 'w' ? 'White' : 'Black';
+    const label = isAiAnalysis
+        ? 'AI analysis (depth ' + th.depth + ')'
+        : (game.turn() === 'w' ? 'White' : 'Black') + ' to move';
 
     const rows = [
         ['U_w',       fmt(Uw,1),       'U_b',       fmt(Ub,1)],
@@ -2908,7 +2813,7 @@ function renderThermoGrid(Uw, Ub, th) {
     ];
 
     let html = '<span class="dash-label" style="grid-column:span 4;color:#666;font-size:0.8em;margin-bottom:2px">' +
-               turn + ' to move</span>';
+               label + '</span>';
     for (const r of rows) {
         html += '<span class="dash-label">' + r[0] + '</span><span class="dash-value">' + r[1] + '</span>';
         html += '<span class="dash-label">' + r[2] + '</span><span class="dash-value">' + r[3] + '</span>';
