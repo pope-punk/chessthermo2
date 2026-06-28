@@ -2305,6 +2305,14 @@ function thermoSearch(g, depth) {
         }
         const F = maxQ + T * Math.log(expSum);
 
+        let S = 0;
+        for (let i = 0; i < n; i++) {
+            const p = expArr[i] / expSum;
+            if (p > 1e-15) S -= p * Math.log(p);
+        }
+        const oppTS = muEntry ? (muEntry['_' + them + 'TS'] || 0) : 0;
+        const F_diff = F - oppTS;
+
         const sqProb = new Float64Array(64);
         for (let i = 0; i < n; i++)
             sqProb[sqIdx(moves[i].from)] += expArr[i] / expSum;
@@ -2320,9 +2328,10 @@ function thermoSearch(g, depth) {
                 - T * Math.log(1 - Math.min(P, 1 - 1e-10));
         }
 
+        newMu['_' + us + 'TS'] = T * S;
         if (muCache.size < MU_CACHE_MAX) muCache.set(bk, newMu);
-        if (thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(key, F);
-        return F;
+        if (thermoCache.size < THERMO_CACHE_MAX) thermoCache.set(key, F_diff);
+        return F_diff;
     }
 
     const moves = g.fast_moves();
