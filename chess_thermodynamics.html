@@ -2164,6 +2164,20 @@ function leafEval_slow(g) {
 // ── 0x88 square → 8×8 XRAY index ─────────────────────────
 function sqIdx(sq88) { return (7 - (sq88 >> 4)) * 8 + (sq88 & 7); }
 
+// ── Robust Temperature via Median Absolute Deviation ──────
+// stddev is dominated by outliers (e.g. CHECKMATE_SCORE among normal Q values).
+// MAD is insensitive to single extreme values, keeping T meaningful.
+function robustT(Qs, n) {
+    const tmp = new Array(n);
+    for (let i = 0; i < n; i++) tmp[i] = Qs[i];
+    tmp.sort((a, b) => a - b);
+    const med = n & 1 ? tmp[n >> 1] : (tmp[(n >> 1) - 1] + tmp[n >> 1]) * 0.5;
+    for (let i = 0; i < n; i++) tmp[i] = Math.abs(Qs[i] - med);
+    tmp.sort((a, b) => a - b);
+    const mad = n & 1 ? tmp[n >> 1] : (tmp[(n >> 1) - 1] + tmp[n >> 1]) * 0.5;
+    return Math.max(1.4826 * mad, T_FLOOR);
+}
+
 // ── Unified Thermodynamic Search: F = T ln Z ──────────────
 // Both sides computed identically — equilibrium requires symmetry.
 // depth 0: leafEval (raw x-ray mobility)
@@ -2246,12 +2260,7 @@ function thermoSearch(g, depth) {
             Qs[i] = baseQ + d;
         }
 
-        let sum = 0;
-        for (let i = 0; i < n; i++) sum += Qs[i];
-        const mean = sum / n;
-        let vsum = 0;
-        for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
-        const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+        const T = robustT(Qs, n);
 
         let maxQ = Qs[0];
         for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
@@ -2316,12 +2325,7 @@ function thermoSearch(g, depth) {
         let qMax = quickQs[0];
         for (let i = 1; i < n; i++) if (quickQs[i] > qMax) qMax = quickQs[i];
 
-        let qSum = 0;
-        for (let i = 0; i < n; i++) qSum += quickQs[i];
-        const qMean = qSum / n;
-        let qVar = 0;
-        for (let i = 0; i < n; i++) qVar += (quickQs[i] - qMean) ** 2;
-        const T_est = Math.max(Math.sqrt(qVar / n), T_FLOOR);
+        const T_est = robustT(quickQs, n);
         const threshold = qMax - BOLTZ_SIGMA * T_est;
 
         const exactIdx = [];
@@ -2383,12 +2387,7 @@ function thermoSearch(g, depth) {
 }
 
 function computeF(Qs, n, cacheKey) {
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += Qs[i];
-    const mean = sum / n;
-    let vsum = 0;
-    for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
-    const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+    const T = robustT(Qs, n);
 
     let maxQ = Qs[0];
     for (let i = 1; i < n; i++) if (Qs[i] > maxQ) maxQ = Qs[i];
@@ -2419,12 +2418,7 @@ function computeThermodynamics(g, depth) {
     }
 
     const n = Qs.length;
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += Qs[i];
-    const mean = sum / n;
-    let vsum = 0;
-    for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
-    const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+    const T = robustT(Qs, n);
     const beta = 1 / T;
 
     let maxQ = Qs[0];
@@ -2536,12 +2530,7 @@ function bestMove(g, timeLimitMs) {
 function buildRootThermo(g, rawMoves, Qs, depth) {
     const n = rawMoves.length;
 
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += Qs[i];
-    const mean = sum / n;
-    let vsum = 0;
-    for (let i = 0; i < n; i++) vsum += (Qs[i] - mean) ** 2;
-    const T = Math.max(Math.sqrt(vsum / n), T_FLOOR);
+    const T = robustT(Qs, n);
     const beta = 1 / T;
 
     let maxQ = Qs[0], bestIdx = 0;
