@@ -2058,7 +2058,8 @@ if (typeof define !== 'undefined')
 
 // ── Constants ──────────────────────────────────────────────
 const T_FLOOR = 0.1;
-const PAWN_XRAY = 3.5;
+const PIECE_VALUE = { p: 8, n: 24, b: 26, r: 40, q: 72, k: 0 };
+const PAWN_XRAY = 11;
 const CHECKMATE_SCORE = 100000;
 const TIME_LIMITS = { easy: 500, medium: 2000, hard: 8000, max: 20000 };
 const MC_SAMPLES = 3;
@@ -2087,7 +2088,8 @@ const XRAY = {};
     for (const color of ['w','b'])
         for (const type of ['p','n','b','r','q','k']) {
             const t = new Int8Array(64);
-            for (let rank=0;rank<8;rank++) for (let file=0;file<8;file++) t[rank*8+file]=xm(type,file,rank,color);
+            const base = PIECE_VALUE[type];
+            for (let rank=0;rank<8;rank++) for (let file=0;file<8;file++) t[rank*8+file]=base+xm(type,file,rank,color);
             XRAY[color+type] = t;
         }
 })();
